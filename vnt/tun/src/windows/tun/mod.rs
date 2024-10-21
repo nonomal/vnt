@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 use libloading::Library;
+use sha2::Digest;
 use std::io;
 use std::net::Ipv4Addr;
-
-use rand::Rng;
 use winapi::um::winbase;
 use winapi::um::{synchapi, winnt};
 
@@ -78,9 +77,10 @@ impl Device {
                 ));
             }
             wintun_log::set_default_logger_if_unset(&win_tun);
-            let _ = Self::delete_for_name(&win_tun, &name_utf16);
-            let mut guid_bytes: [u8; 16] = [0u8; 16];
-            rand::thread_rng().fill(&mut guid_bytes);
+            if Self::delete_for_name(&win_tun, &name_utf16).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            let guid_bytes: [u8; 16] = hash_guid(&name);
             let guid = u128::from_ne_bytes(guid_bytes);
             //SAFETY: guid is a unique integer so transmuting either all zeroes or the user's preferred
             //guid to the winapi guid type is safe and will allow the windows kernel to see our GUID
@@ -101,7 +101,7 @@ impl Device {
                 ));
             }
             // 开启session
-            let session = win_tun.WintunStartSession(adapter, MAX_RING_CAPACITY);
+            let session = win_tun.WintunStartSession(adapter, 4 * 1024 * 1024);
             if session.is_null() {
                 log::error!("session.is_null {:?}", io::Error::last_os_error());
                 return Err(io::Error::new(
@@ -152,7 +152,15 @@ impl Device {
         Ok(())
     }
 }
-
+fn hash_guid(input: &str) -> [u8; 16] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(input.as_bytes());
+    hasher.update(b"VNT");
+    hasher.update(input.as_bytes());
+    hasher.update(b"2024");
+    let hash: [u8; 32] = hasher.finalize().into();
+    hash[..16].try_into().unwrap()
+}
 impl IFace for Device {
     fn version(&self) -> io::Result<String> {
         let version = unsafe { self.win_tun.WintunGetRunningDriverVersion() };
@@ -172,7 +180,7 @@ impl IFace for Device {
 
     fn shutdown(&self) -> io::Result<()> {
         unsafe {
-            if 0 == synchapi::SetEvent(self.shutdown_event) {
+            if winapi::shared::minwindef::TRUE == synchapi::SetEvent(self.shutdown_event) {
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())
@@ -237,7 +245,10 @@ impl Device {
             if last_error == winapi::shared::winerror::ERROR_NO_MORE_ITEMS {
                 Ok(None)
             } else {
-                Err(io::Error::new(io::ErrorKind::Other, "try_receive failed"))
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("try_receive failed {:?}", io::Error::last_os_error()),
+                ))
             }
         } else {
             Ok(Some(packet::TunPacket {
@@ -254,13 +265,21 @@ impl Device {
         loop {
             //Try 16 times to receive without blocking so we don't have to issue a syscall to wait
             //for the event if packets are being received at a rapid rate
-            for _i in 0..20 {
-                match self.try_receive()? {
-                    None => {
-                        continue;
-                    }
-                    Some(packet) => {
-                        return Ok(packet);
+            for i in 0..20 {
+                match self.try_receive() {
+                    Ok(data) => match data {
+                        None => {
+                            continue;
+                        }
+                        Some(packet) => {
+                            return Ok(packet);
+                        }
+                    },
+                    Err(e) => {
+                        if i > 10 {
+                            // 某些系统存在错误退出的情况(原因不明)，这里尝试忽略部分错误
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -284,11 +303,11 @@ impl Device {
                     if result == winbase::WAIT_OBJECT_0 {
                         //We have data!
                         continue;
-                    } else if result == winbase::WAIT_OBJECT_0 + 1 {
+                    } else {
                         //Shutdown event triggered
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
-                            "Shutdown event triggered",
+                            format!("Shutdown event triggered {}", io::Error::last_os_error()),
                         ));
                     }
                 }
@@ -336,8 +355,8 @@ impl Drop for Device {
             }
             self.win_tun.WintunEndSession(self.session);
             self.win_tun.WintunCloseAdapter(self.adapter);
-            if 0 != self.win_tun.WintunDeleteDriver() {
-                log::warn!("WintunDeleteDriver failed")
+            if winapi::shared::minwindef::FALSE == self.win_tun.WintunDeleteDriver() {
+                log::warn!("WintunDeleteDriver failed {:?}", io::Error::last_os_error())
             }
         }
     }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::ops::{Div, Mul};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -89,7 +90,7 @@ pub fn punch(
     scheduler: &Scheduler,
     context: ChannelContext,
     nat_test: NatTest,
-    device_list: Arc<Mutex<(u16, Vec<PeerDeviceInfo>)>>,
+    device_map: Arc<Mutex<(u16, HashMap<Ipv4Addr, PeerDeviceInfo>)>>,
     current_device: Arc<AtomicCell<CurrentDeviceInfo>>,
     client_cipher: Cipher,
     receiver: PunchReceiver,
@@ -101,7 +102,7 @@ pub fn punch(
         scheduler,
         context,
         nat_test,
-        device_list,
+        device_map,
         current_device.clone(),
         client_cipher.clone(),
         0,
@@ -148,7 +149,7 @@ fn punch_start(
                 *v += 1;
                 *v
             } else {
-                guard.insert(peer_ip, 1);
+                guard.insert(peer_ip, 0);
                 0
             }
         };
@@ -158,7 +159,7 @@ fn punch_start(
             log::error!("{:?}", e);
             continue;
         }
-        if let Err(e) = punch.punch(packet.buffer(), peer_ip, nat_info, count < 2) {
+        if let Err(e) = punch.punch(packet.buffer(), peer_ip, nat_info, count < 2, count) {
             log::warn!("{:?}", e)
         }
     }
@@ -169,19 +170,19 @@ fn punch_request(
     scheduler: &Scheduler,
     context: ChannelContext,
     nat_test: NatTest,
-    device_list: Arc<Mutex<(u16, Vec<PeerDeviceInfo>)>>,
+    device_map: Arc<Mutex<(u16, HashMap<Ipv4Addr, PeerDeviceInfo>)>>,
     current_device: Arc<AtomicCell<CurrentDeviceInfo>>,
     client_cipher: Cipher,
     count: usize,
     punch_record: Arc<Mutex<HashMap<Ipv4Addr, usize>>>,
-    mut last_punch_record: HashMap<Ipv4Addr, usize>,
+    mut last_punch_record: HashMap<Ipv4Addr, PunchRecordItem>,
 ) {
     let curr = current_device.load();
     let secs = if curr.status.online() {
         if let Err(e) = punch0(
             &context,
             &nat_test,
-            &device_list,
+            &device_map,
             curr,
             &client_cipher,
             &punch_record,
@@ -190,7 +191,7 @@ fn punch_request(
         ) {
             log::warn!("{:?}", e)
         }
-        let sleep_time = [5, 6, 7];
+        let sleep_time = [6, 7];
         Duration::from_secs(sleep_time[count % sleep_time.len()])
     } else {
         Duration::from_secs(5)
@@ -200,7 +201,7 @@ fn punch_request(
             s,
             context,
             nat_test,
-            device_list,
+            device_map,
             current_device,
             client_cipher,
             count + 1,
@@ -212,16 +213,21 @@ fn punch_request(
         log::info!("定时任务停止");
     }
 }
+#[derive(Copy, Clone, Default)]
+struct PunchRecordItem {
+    pub punch_record: usize,
+    pub last_p2p_num: usize,
+}
 
 /// 随机对需要打洞的客户端发起打洞请求
 fn punch0(
     context: &ChannelContext,
     nat_test: &NatTest,
-    device_list: &Arc<Mutex<(u16, Vec<PeerDeviceInfo>)>>,
+    device_map: &Arc<Mutex<(u16, HashMap<Ipv4Addr, PeerDeviceInfo>)>>,
     current_device: CurrentDeviceInfo,
     client_cipher: &Cipher,
     punch_record: &Mutex<HashMap<Ipv4Addr, usize>>,
-    last_punch_record: &mut HashMap<Ipv4Addr, usize>,
+    last_punch_record: &mut HashMap<Ipv4Addr, PunchRecordItem>,
     total_count: usize,
 ) -> anyhow::Result<()> {
     let nat_info = nat_test.nat_info();
@@ -232,33 +238,39 @@ fn punch0(
             || nat_info.public_ports.iter().filter(|&&v| v == 0).count()
                 > nat_info.public_ports.len() / 2)
     {
-        log::info!("公网地址为空，暂时放弃打洞,第{}轮", total_count);
+        log::info!("未获取到公网地址，暂时放弃打洞,第{}轮", total_count);
         return Ok(());
     }
     let current_ip = current_device.virtual_ip;
-    let mut list: Vec<PeerDeviceInfo> = device_list
+    let mut list: Vec<PeerDeviceInfo> = device_map
         .lock()
         .1
-        .iter()
-        .filter(|info| info.status.is_online() && info.virtual_ip > current_ip)
+        .values()
+        .filter(|info| !info.wireguard && info.virtual_ip > current_ip)
         .cloned()
         .collect();
     list.shuffle(&mut rand::thread_rng());
     for info in list {
-        let punch_count = punch_record
+        if info.status.is_offline() {
+            // 客户端掉线了要重置打洞记录
+            punch_record.lock().remove(&info.virtual_ip);
+            continue;
+        }
+        let mut punch_count = punch_record
             .lock()
             .get(&info.virtual_ip)
             .cloned()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .mul(2)
+            .div(3);
         let p2p_num = context.route_table.p2p_num(&info.virtual_ip);
-        let mut max_punch_interval = 70;
+        let mut max_punch_interval = 50;
         if p2p_num > 0 {
-            if punch_count == 0 {
-                continue;
-            }
             if p2p_num >= context.channel_num() {
                 //通道数满足要求，不再打洞
-                punch_record.lock().remove(&info.virtual_ip);
+                if punch_count != 0 {
+                    punch_record.lock().remove(&info.virtual_ip);
+                }
                 continue;
             }
             //有p2p通道，但是通道数量不够，则继续打洞
@@ -266,13 +278,18 @@ fn punch0(
             max_punch_interval = 300;
         }
         // 能发起打洞的前提是自己空闲，这里会间隔5秒以上发起一次打洞，所以假定上一轮打洞已结束
-        let last_punch = last_punch_record
-            .get(&info.virtual_ip)
-            .cloned()
-            .unwrap_or(0);
+        let last_punch = last_punch_record.entry(info.virtual_ip).or_default();
+        if last_punch.last_p2p_num > p2p_num {
+            // 打的洞掉线了,需要重置重新打
+            punch_record.lock().remove(&info.virtual_ip);
+            punch_count = 0;
+        }
+
         // 梯度增加打洞时间间隔
-        if total_count > last_punch + punch_count.min(max_punch_interval) {
-            last_punch_record.insert(info.virtual_ip, total_count);
+        if total_count > last_punch.punch_record + punch_count.min(max_punch_interval) {
+            // 记录打洞周期，抑制下一次打洞，从而递减打洞频率
+            last_punch.punch_record = total_count;
+            last_punch.last_p2p_num = p2p_num;
             let packet = punch_packet(
                 client_cipher,
                 current_device.virtual_ip(),
@@ -286,7 +303,7 @@ fn punch0(
                 punch_count,
                 total_count,
             );
-            context.send_default(packet.buffer(), current_device.connect_server)?;
+            context.send_default(&packet, current_device.connect_server)?;
             break;
         }
     }
@@ -309,6 +326,7 @@ fn punch_packet(
     punch_reply.public_port = nat_info.public_ports.get(0).map_or(0, |v| *v as u32);
     punch_reply.public_ports = nat_info.public_ports.iter().map(|e| *e as u32).collect();
     punch_reply.public_port_range = nat_info.public_port_range as u32;
+    punch_reply.public_tcp_port = nat_info.public_tcp_port as u32;
     punch_reply.local_ip = u32::from(nat_info.local_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED));
     punch_reply.local_port = nat_info.udp_ports[0] as u32;
     punch_reply.tcp_port = nat_info.tcp_port as u32;
@@ -318,6 +336,7 @@ fn punch_packet(
         punch_reply.ipv6 = ipv6.octets().to_vec();
     }
     punch_reply.nat_type = protobuf::EnumOrUnknown::new(PunchNatType::from(nat_info.nat_type));
+    punch_reply.punch_model = protobuf::EnumOrUnknown::new(nat_info.punch_model.into());
     log::info!("请求打洞={:?}", punch_reply);
     let bytes = punch_reply
         .write_to_bytes()

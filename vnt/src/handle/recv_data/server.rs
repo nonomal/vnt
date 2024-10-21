@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use std::collections::HashMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -12,8 +13,6 @@ use protobuf::Message;
 use packet::icmp::{icmp, Kind};
 use packet::ip::ipv4;
 use packet::ip::ipv4::packet::IpV4Packet;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-use tun::device::IFace;
 
 use crate::channel::context::ChannelContext;
 use crate::channel::{Route, RouteKey};
@@ -26,50 +25,50 @@ use crate::handle::callback::{ErrorInfo, ErrorType, HandshakeInfo, RegisterInfo,
 use crate::handle::handshaker;
 use crate::handle::handshaker::Handshake;
 use crate::handle::recv_data::PacketHandler;
-use crate::handle::{
-    registrar, BaseConfigInfo, ConnectStatus, CurrentDeviceInfo, PeerDeviceInfo, GATEWAY_IP,
-};
+use crate::handle::{registrar, BaseConfigInfo, ConnectStatus, CurrentDeviceInfo, PeerDeviceInfo};
 use crate::nat::NatTest;
 use crate::proto::message::{DeviceList, HandshakeResponse, RegistrationResponse};
 use crate::protocol::body::ENCRYPTION_RESERVED;
 use crate::protocol::control_packet::ControlPacket;
 use crate::protocol::error_packet::InErrorPacket;
 use crate::protocol::{ip_turn_packet, service_packet, NetPacket, Protocol, MAX_TTL};
-use crate::tun_tap_device::tun_create_helper::DeviceAdapter;
+use crate::tun_tap_device::vnt_device::DeviceWrite;
 use crate::{proto, PeerClientInfo};
 
 /// 处理来源于服务端的包
 #[derive(Clone)]
-pub struct ServerPacketHandler<Call> {
+pub struct ServerPacketHandler<Call, Device> {
     #[cfg(feature = "server_encrypt")]
     rsa_cipher: Arc<Mutex<Option<RsaCipher>>>,
     server_cipher: Cipher,
     current_device: Arc<AtomicCell<CurrentDeviceInfo>>,
-    device: DeviceAdapter,
-    device_list: Arc<Mutex<(u16, Vec<PeerDeviceInfo>)>>,
+    device: Device,
+    device_map: Arc<Mutex<(u16, HashMap<Ipv4Addr, PeerDeviceInfo>)>>,
     config_info: BaseConfigInfo,
     nat_test: NatTest,
     callback: Call,
     #[cfg(feature = "server_encrypt")]
     up_key_time: Arc<AtomicCell<Instant>>,
-    #[cfg(not(target_os = "android"))]
-    route_record: Arc<Mutex<Vec<(Ipv4Addr, Ipv4Addr)>>>,
     external_route: ExternalRoute,
     handshake: Handshake,
+    #[cfg(feature = "integrated_tun")]
+    tun_device_helper: crate::tun_tap_device::tun_create_helper::TunDeviceHelper,
 }
 
-impl<Call> ServerPacketHandler<Call> {
+impl<Call, Device> ServerPacketHandler<Call, Device> {
     pub fn new(
         #[cfg(feature = "server_encrypt")] rsa_cipher: Arc<Mutex<Option<RsaCipher>>>,
         server_cipher: Cipher,
         current_device: Arc<AtomicCell<CurrentDeviceInfo>>,
-        device: DeviceAdapter,
-        device_list: Arc<Mutex<(u16, Vec<PeerDeviceInfo>)>>,
+        device: Device,
+        device_map: Arc<Mutex<(u16, HashMap<Ipv4Addr, PeerDeviceInfo>)>>,
         config_info: BaseConfigInfo,
         nat_test: NatTest,
         callback: Call,
         external_route: ExternalRoute,
         handshake: Handshake,
+        #[cfg(feature = "integrated_tun")]
+        tun_device_helper: crate::tun_tap_device::tun_create_helper::TunDeviceHelper,
     ) -> Self {
         Self {
             #[cfg(feature = "server_encrypt")]
@@ -77,21 +76,25 @@ impl<Call> ServerPacketHandler<Call> {
             server_cipher,
             current_device,
             device,
-            device_list,
+            device_map,
             config_info,
             nat_test,
             callback,
             #[cfg(feature = "server_encrypt")]
-            up_key_time: Arc::new(AtomicCell::new(Instant::now() - Duration::from_secs(60))),
-            #[cfg(not(target_os = "android"))]
-            route_record: Arc::new(Mutex::default()),
+            up_key_time: Arc::new(AtomicCell::new(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or(Instant::now()),
+            )),
             external_route,
             handshake,
+            #[cfg(feature = "integrated_tun")]
+            tun_device_helper,
         }
     }
 }
 
-impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
+impl<Call: VntCallback, Device: DeviceWrite> PacketHandler for ServerPacketHandler<Call, Device> {
     fn handle(
         &self,
         mut net_packet: NetPacket<&mut [u8]>,
@@ -100,6 +103,14 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
         context: &ChannelContext,
         current_device: &CurrentDeviceInfo,
     ) -> anyhow::Result<()> {
+        if !current_device.is_server_addr(route_key.addr) {
+            //拦截不是服务端的流量
+            log::warn!(
+                "route_key={:?},不是来源于服务端地址{}",
+                route_key,
+                current_device.connect_server
+            );
+        }
         context
             .route_table
             .update_read_time(&net_packet.source(), &route_key);
@@ -129,7 +140,7 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
                             self.config_info.token.clone(),
                             key,
                         )?;
-                        context.send_by_key(packet.buffer(), route_key)?;
+                        context.send_by_key(&packet, route_key)?;
                     }
                 }
             }
@@ -140,6 +151,8 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
             let response = HandshakeResponse::parse_from_bytes(net_packet.payload())
                 .map_err(|e| anyhow!("HandshakeResponse {:?}", e))?;
             log::info!("握手响应:{:?},{}", route_key, response);
+            //设置为默认通道
+            context.set_default_route_key(route_key);
             //如果开启了加密，则发送加密握手请求
             #[cfg(feature = "server_encrypt")]
             if let Some(key) = self.server_cipher.key() {
@@ -153,7 +166,7 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
                                 key,
                             )?;
                             drop(guard);
-                            context.send_by_key(packet.buffer(), route_key)?;
+                            context.send_by_key(&packet, route_key)?;
                             return Ok(());
                         }
                         log::warn!(
@@ -188,7 +201,7 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
                         self.config_info.token.clone(),
                         key,
                     )?;
-                    context.send_by_key(packet.buffer(), route_key)?;
+                    context.send_by_key(&packet, route_key)?;
                     self.rsa_cipher.lock().replace(rsa_cipher);
                 }
                 return Ok(());
@@ -200,7 +213,7 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
             let handshake_info = HandshakeInfo::new_no_secret(response.version);
             if self.callback.handshake(handshake_info) {
                 //没有加密，则发送注册请求
-                self.register(current_device, context)?;
+                self.register(current_device, context, route_key)?;
             }
 
             return Ok(());
@@ -235,6 +248,11 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
                             _ => {}
                         }
                     }
+                    ip_turn_packet::Protocol::WGIpv4 => {
+                        if self.config_info.allow_wire_guard {
+                            self.device.write(net_packet.payload())?;
+                        }
+                    }
                     ip_turn_packet::Protocol::Ipv4Broadcast => {}
                     ip_turn_packet::Protocol::Unknown(_) => {}
                 }
@@ -246,7 +264,7 @@ impl<Call: VntCallback> PacketHandler for ServerPacketHandler<Call> {
     }
 }
 
-impl<Call: VntCallback> ServerPacketHandler<Call> {
+impl<Call: VntCallback, Device: DeviceWrite> ServerPacketHandler<Call, Device> {
     fn service(
         &self,
         context: &ChannelContext,
@@ -279,6 +297,10 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                     let public_port = response.public_port as u16;
                     self.nat_test
                         .update_addr(route_key.index(), public_ip, public_port);
+                    if route_key.protocol().is_tcp() {
+                        log::info!("更新公网tcp端口 {public_port}");
+                        self.nat_test.update_tcp_port(public_port);
+                    }
                     let old = current_device;
                     let mut cur = *current_device;
                     loop {
@@ -305,80 +327,90 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                         if old.virtual_ip != Ipv4Addr::UNSPECIFIED {
                             log::info!("ip发生变化,old:{:?},response={:?}", old, response);
                         }
-                        #[cfg(target_os = "android")]
+                        let device_config = crate::handle::callback::DeviceConfig::new(
+                            #[cfg(feature = "integrated_tun")]
+                            #[cfg(target_os = "windows")]
+                            self.config_info.tap,
+                            #[cfg(feature = "integrated_tun")]
+                            #[cfg(any(
+                                target_os = "windows",
+                                target_os = "linux",
+                                target_os = "macos"
+                            ))]
+                            self.config_info.device_name.clone(),
+                            self.config_info.mtu,
+                            virtual_ip,
+                            virtual_netmask,
+                            virtual_gateway,
+                            virtual_network,
+                            self.external_route.to_route(),
+                        );
+                        #[cfg(not(feature = "integrated_tun"))]
+                        self.callback.create_device(device_config);
+                        #[cfg(feature = "integrated_tun")]
                         {
-                            let device_config = crate::handle::callback::DeviceConfig::new(
-                                virtual_ip,
-                                virtual_netmask,
-                                virtual_gateway,
-                                virtual_network,
-                                self.external_route.to_route(),
-                            );
-                            let device_fd = self.callback.generate_tun(device_config);
-                            if device_fd == 0 {
-                                self.callback.error(ErrorInfo::new_msg(
-                                    ErrorType::Unknown,
-                                    "device_fd == 0".into(),
-                                ));
-                            } else {
-                                if let Err(e) = self.device.start(device_fd as _) {
-                                    self.callback.error(ErrorInfo::new_msg(
-                                        ErrorType::Unknown,
-                                        format!("{:?}", e),
-                                    ));
-                                }
-                            }
-                        }
-                        #[cfg(not(target_os = "android"))]
-                        {
-                            if let Err(e) = self.device.set_ip(virtual_ip, virtual_netmask) {
-                                log::error!("LocalIpExists {:?}", e);
-                                self.callback.error(ErrorInfo::new_msg(
-                                    ErrorType::LocalIpExists,
-                                    format!("set_ip {:?}", e),
-                                ));
-                                return Ok(());
-                            }
-                            let mut guard = self.route_record.lock();
-                            for (dest, mask) in guard.drain(..) {
-                                if let Err(e) = self.device.delete_route(dest, mask) {
-                                    log::warn!("删除路由失败 ={:?}", e);
-                                }
-                            }
-                            if let Err(e) =
-                                self.device.add_route(virtual_network, virtual_netmask, 1)
-                            {
-                                log::warn!("添加默认路由失败 ={:?}", e);
-                            } else {
-                                guard.push((virtual_network, virtual_netmask));
-                            }
-                            if let Err(e) =
-                                self.device
-                                    .add_route(Ipv4Addr::BROADCAST, Ipv4Addr::BROADCAST, 1)
-                            {
-                                log::warn!("添加广播路由失败 ={:?}", e);
-                            } else {
-                                guard.push((Ipv4Addr::BROADCAST, Ipv4Addr::BROADCAST));
-                            }
-
-                            if let Err(e) = self.device.add_route(
-                                Ipv4Addr::from([224, 0, 0, 0]),
-                                Ipv4Addr::from([240, 0, 0, 0]),
-                                1,
+                            self.tun_device_helper.stop();
+                            #[cfg(any(
+                                target_os = "windows",
+                                target_os = "linux",
+                                target_os = "macos"
+                            ))]
+                            match crate::tun_tap_device::create_device(
+                                device_config,
+                                &self.callback,
                             ) {
-                                log::warn!("添加组播路由失败 ={:?}", e);
-                            } else {
-                                guard.push((
-                                    Ipv4Addr::from([224, 0, 0, 0]),
-                                    Ipv4Addr::from([240, 0, 0, 0]),
-                                ));
+                                Ok(device) => {
+                                    use tun::device::IFace;
+                                    let tun_info = crate::handle::callback::DeviceInfo::new(
+                                        device.name().unwrap_or("unknown".into()),
+                                        device.version().unwrap_or("unknown".into()),
+                                    );
+                                    log::info!("tun信息{:?}", tun_info);
+                                    self.callback.create_tun(tun_info);
+                                    self.tun_device_helper
+                                        .start(device, self.config_info.allow_wire_guard)?;
+                                }
+                                Err(e) => {
+                                    log::error!("{:?}", e);
+                                    self.callback.error(e);
+                                }
                             }
-
-                            for (dest, mask) in self.external_route.to_route() {
-                                if let Err(e) = self.device.add_route(dest, mask, 1) {
-                                    log::warn!("添加路由失败 ={:?}", e);
+                            #[cfg(target_os = "android")]
+                            {
+                                let device_config = crate::handle::callback::DeviceConfig::new(
+                                    self.config_info.mtu,
+                                    virtual_ip,
+                                    virtual_netmask,
+                                    virtual_gateway,
+                                    virtual_network,
+                                    self.external_route.to_route(),
+                                );
+                                let device_fd = self.callback.generate_tun(device_config);
+                                if device_fd == 0 {
+                                    self.callback.error(ErrorInfo::new_msg(
+                                        ErrorType::FailedToCrateDevice,
+                                        "device_fd == 0".into(),
+                                    ));
                                 } else {
-                                    guard.push((dest, mask));
+                                    match tun::Device::new(device_fd as _) {
+                                        Ok(device) => {
+                                            if let Err(e) = self.tun_device_helper.start(
+                                                Arc::new(device),
+                                                self.config_info.allow_wire_guard,
+                                            ) {
+                                                self.callback.error(ErrorInfo::new_msg(
+                                                    ErrorType::FailedToCrateDevice,
+                                                    format!("{:?}", e),
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.callback.error(ErrorInfo::new_msg(
+                                                ErrorType::FailedToCrateDevice,
+                                                format!("{:?}", e),
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -398,7 +430,7 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
             service_packet::Protocol::SecretHandshakeResponse => {
                 log::info!("SecretHandshakeResponse");
                 //加密握手结束，发送注册数据
-                self.register(current_device, context)?;
+                self.register(current_device, context, route_key)?;
             }
             _ => {
                 log::warn!(
@@ -419,14 +451,18 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                     info.device_status as u8,
                     info.client_secret,
                     info.client_secret_hash,
+                    info.wireguard,
                 )
             })
             .collect();
         {
-            let mut dev = self.device_list.lock();
+            let mut dev = self.device_map.lock();
             //这里可能会收到旧的消息，但是随着时间推移总会收到新的
             dev.0 = epoch;
-            dev.1 = ip_list.clone();
+            dev.1.clear();
+            for info in ip_list.clone() {
+                dev.1.insert(info.virtual_ip, info);
+            }
         }
         self.callback.peer_client_list(
             ip_list
@@ -439,11 +475,14 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
         &self,
         current_device: &CurrentDeviceInfo,
         context: &ChannelContext,
+        route_key: RouteKey,
     ) -> anyhow::Result<()> {
         if current_device.status.online() {
             log::info!("已连接的不需要注册，{:?}", self.config_info);
             return Ok(());
         }
+        //设置为默认通道
+        context.set_default_route_key(route_key);
         let token = self.config_info.token.clone();
         let device_id = self.config_info.device_id.clone();
         let name = self.config_info.name.clone();
@@ -468,7 +507,7 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
         )?;
         log::info!("发送注册请求，{:?}", self.config_info);
         //注册请求只发送到默认通道
-        context.send_default(response.buffer(), current_device.connect_server)?;
+        context.send_default(&response, current_device.connect_server)?;
         Ok(())
     }
     fn error(
@@ -490,7 +529,7 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                 self.callback.error(err);
                 //掉线epoch要归零
                 {
-                    let mut dev = self.device_list.lock();
+                    let mut dev = self.device_map.lock();
                     dev.0 = 0;
                     drop(dev);
                 }
@@ -538,12 +577,12 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                 let rt = (current_time - pong_packet.time()) as i64;
                 let route = Route::from(route_key, metric, rt);
                 context.route_table.add_route(net_packet.source(), route);
-                let epoch = self.device_list.lock().0;
+                let epoch = self.device_map.lock().0;
                 if pong_packet.epoch() != epoch {
                     //纪元不一致，可能有新客户端连接，向服务端拉取客户端列表
                     let mut poll_device = NetPacket::new_encrypt([0; 12 + ENCRYPTION_RESERVED])?;
                     poll_device.set_source(current_device.virtual_ip);
-                    poll_device.set_destination(GATEWAY_IP);
+                    poll_device.set_destination(current_device.virtual_gateway);
                     poll_device.set_default_version();
                     poll_device.set_gateway_flag(true);
                     poll_device.first_set_ttl(MAX_TTL);
@@ -552,7 +591,7 @@ impl<Call: VntCallback> ServerPacketHandler<Call> {
                         .set_transport_protocol(service_packet::Protocol::PullDeviceList.into());
                     self.server_cipher.encrypt_ipv4(&mut poll_device)?;
                     //发送到默认服务端即可
-                    context.send_default(poll_device.buffer(), current_device.connect_server)?;
+                    context.send_default(&poll_device, current_device.connect_server)?;
                 }
             }
             ControlPacket::AddrResponse(addr_packet) => {

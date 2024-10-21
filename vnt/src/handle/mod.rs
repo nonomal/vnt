@@ -1,5 +1,6 @@
+use crate::channel::socket::LocalInterface;
 use crossbeam_utils::atomic::AtomicCell;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub mod callback;
 mod extension;
@@ -7,6 +8,7 @@ pub mod handshaker;
 pub mod maintain;
 pub mod recv_data;
 pub mod registrar;
+#[cfg(feature = "integrated_tun")]
 pub mod tun_tap;
 
 const SELF_IP: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 2);
@@ -21,12 +23,6 @@ pub fn now_time() -> u64 {
     }
 }
 
-/// 是否在一个网段
-fn check_dest(dest: Ipv4Addr, virtual_netmask: Ipv4Addr, virtual_network: Ipv4Addr) -> bool {
-    u32::from_be_bytes(dest.octets()) & u32::from_be_bytes(virtual_netmask.octets())
-        == u32::from_be_bytes(virtual_network.octets())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerDeviceInfo {
     pub virtual_ip: Ipv4Addr,
@@ -34,6 +30,7 @@ pub struct PeerDeviceInfo {
     pub status: PeerDeviceStatus,
     pub client_secret: bool,
     pub client_secret_hash: Vec<u8>,
+    pub wireguard: bool,
 }
 
 impl PeerDeviceInfo {
@@ -43,6 +40,7 @@ impl PeerDeviceInfo {
         status: u8,
         client_secret: bool,
         client_secret_hash: Vec<u8>,
+        wireguard: bool,
     ) -> Self {
         Self {
             virtual_ip,
@@ -50,6 +48,7 @@ impl PeerDeviceInfo {
             status: PeerDeviceStatus::from(status),
             client_secret,
             client_secret_hash,
+            wireguard,
         }
     }
 }
@@ -64,6 +63,15 @@ pub struct BaseConfigInfo {
     pub device_id: String,
     pub server_addr: String,
     pub name_servers: Vec<String>,
+    pub mtu: u32,
+    #[cfg(feature = "integrated_tun")]
+    #[cfg(target_os = "windows")]
+    pub tap: bool,
+    #[cfg(feature = "integrated_tun")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    pub device_name: Option<String>,
+    pub allow_wire_guard: bool,
+    pub default_interface: LocalInterface,
 }
 
 impl BaseConfigInfo {
@@ -76,6 +84,15 @@ impl BaseConfigInfo {
         device_id: String,
         server_addr: String,
         name_servers: Vec<String>,
+        mtu: u32,
+        #[cfg(feature = "integrated_tun")]
+        #[cfg(target_os = "windows")]
+        tap: bool,
+        #[cfg(feature = "integrated_tun")]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        device_name: Option<String>,
+        allow_wire_guard: bool,
+        default_interface: LocalInterface,
     ) -> Self {
         Self {
             name,
@@ -86,6 +103,15 @@ impl BaseConfigInfo {
             device_id,
             server_addr,
             name_servers,
+            mtu,
+            #[cfg(feature = "integrated_tun")]
+            #[cfg(target_os = "windows")]
+            tap,
+            #[cfg(feature = "integrated_tun")]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            device_name,
+            allow_wire_guard,
+            default_interface,
         }
     }
 }
@@ -99,6 +125,9 @@ pub enum PeerDeviceStatus {
 impl PeerDeviceStatus {
     pub fn is_online(&self) -> bool {
         self == &PeerDeviceStatus::Online
+    }
+    pub fn is_offline(&self) -> bool {
+        self == &PeerDeviceStatus::Offline
     }
 }
 
@@ -194,10 +223,10 @@ impl CurrentDeviceInfo {
         virtual_gateway: Ipv4Addr,
     ) {
         let broadcast_ip = (!u32::from_be_bytes(virtual_netmask.octets()))
-            | u32::from_be_bytes(virtual_gateway.octets());
+            | u32::from_be_bytes(virtual_ip.octets());
         let broadcast_ip = Ipv4Addr::from(broadcast_ip);
-        let virtual_network = u32::from_be_bytes(virtual_netmask.octets())
-            & u32::from_be_bytes(virtual_gateway.octets());
+        let virtual_network =
+            u32::from_be_bytes(virtual_netmask.octets()) & u32::from_be_bytes(virtual_ip.octets());
         let virtual_network = Ipv4Addr::from(virtual_network);
         self.virtual_ip = virtual_ip;
         self.virtual_netmask = virtual_netmask;
@@ -213,8 +242,23 @@ impl CurrentDeviceInfo {
     pub fn virtual_gateway(&self) -> Ipv4Addr {
         self.virtual_gateway
     }
+    #[inline]
     pub fn is_gateway(&self, ip: &Ipv4Addr) -> bool {
         &self.virtual_gateway == ip || ip == &GATEWAY_IP
+    }
+    #[inline]
+    pub fn not_in_network(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & u32::from(self.virtual_netmask) != u32::from(self.virtual_network)
+    }
+    pub fn is_server_addr(&self, addr: SocketAddr) -> bool {
+        if self.connect_server == addr {
+            return true;
+        }
+        let f = |ip: IpAddr| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(v6) => v6.to_ipv4(),
+        };
+        addr.port() == self.connect_server.port() && f(addr.ip()) == f(self.connect_server.ip())
     }
 }
 pub fn change_status(

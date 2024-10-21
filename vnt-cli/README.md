@@ -34,6 +34,8 @@
 
 注意：仅在windows上支持使用tap，用于兼容低版本windows系统（低版本windows不支持wintun）
 
+使用tap模式需要手动创建tap网卡，使用--nic参数指定已经创建好的tap网卡名称
+
 ### --nic `<tun0>`
 
 指定虚拟网卡名称，默认tun模式使用vnt-tun，tap模式使用vnt-tap
@@ -72,9 +74,11 @@
 
 设置虚拟网卡的mtu值，大多数情况下使用默认值效率会更高，也可根据实际情况微调这个值，不加密默认为1450，加密默认为1410
 
-### --tcp
+### ~~--tcp~~
 
-和服务端使用tcp通信。有些网络提供商对UDP限制比较大，这个时候可以选择使用TCP模式，提高稳定性。一般来说udp延迟和消耗更低
+~~和服务端使用tcp通信。有些网络提供商对UDP限制比较大，这个时候可以选择使用TCP模式，提高稳定性。一般来说udp延迟和消耗更低~~
+
+新版本使用 `-s tcp://`的形式使用tcp
 
 ### --ip `<IP>`
 
@@ -92,18 +96,18 @@ aes_gcm/aes_cbc/aes_ecb/sm4_cbc/chacha20_poly1305/chacha20/xor，默认使用aes
 
 特别说明：xor只是对数据进行简单异或，仅仅避免了明文传输，安全性很差，同时对性能影响也极小；
 
-| 密码位数  | model             | 加密算法              |  
-|-------|-------------------|-------------------|
-| 1~8位  | aes_gcm           | AES128-GCM        |
-| `>=`8 | aes_gcm           | AES256-GCM        |
-| 1~8位  | aes_cbc           | AES128-CBC        |
-| `>=`8 | aes_cbc           | AES256-CBC        |
-| 1~8位  | aes_ecb           | AES128-ECB        |
-| `>=`8 | aes_ecb           | AES256-ECB        |
-| `>0`  | sm4_cbc           | SM4-CBC           |
-| `>0`  | chacha20_poly1305 | ChaCha20-Poly1305 |
-| `>0`  | chacha20          | ChaCha20          |
-| `>0`  | xor               | 简单异或混淆            |
+| 密码位数   | model             | 加密算法              |  
+|--------|-------------------|-------------------|
+| `< 8`  | aes_gcm           | AES128-GCM        |
+| `>= 8` | aes_gcm           | AES256-GCM        |
+| `< 8`  | aes_cbc           | AES128-CBC        |
+| `>= 8` | aes_cbc           | AES256-CBC        |
+| `< 8`  | aes_ecb           | AES128-ECB        |
+| `>= 8` | aes_ecb           | AES256-ECB        |
+| `> 0`  | sm4_cbc           | SM4-CBC           |
+| `> 0`  | chacha20_poly1305 | ChaCha20-Poly1305 |
+| `> 0`  | chacha20          | ChaCha20          |
+| `> 0`  | xor               | 简单异或混淆            |
 
 ### --finger
 
@@ -133,7 +137,7 @@ aes_gcm/aes_cbc/aes_ecb/sm4_cbc/chacha20_poly1305/chacha20/xor，默认使用aes
 ### --no-proxy
 
 关闭内置的ip代理，内置的代理较为简单，而且一般来说直接使用网卡NAT转发性能会更高，
-有需要可以自行配置NAT转发，[可参考‘编译’小节中的NAT配置](https://github.com/lbl8603/vnt#%E7%BC%96%E8%AF%91)
+有需要可以自行配置NAT转发，[可参考‘编译’小节中的NAT配置](https://github.com/vnt-dev/vnt#%E7%BC%96%E8%AF%91)
 
 ### --dns `<223.5.5.5>`
 
@@ -141,9 +145,9 @@ aes_gcm/aes_cbc/aes_ecb/sm4_cbc/chacha20_poly1305/chacha20/xor，默认使用aes
 
 当地址解析失败时，会依次尝试后面的dns，直到有A记录、AAAA记录(或TXT记录)的解析结果
 
-### --mapping `<udp:0.0.0.0:80->10.26.0.10:80>`
+### --mapping `<udp:0.0.0.0:80-10.26.0.10:80>`
 
-端口映射,可以设置多个映射地址，例如 '--mapping udp:0.0.0.0:80->10.26.0.10:80 --mapping tcp:0.0.0.0:80->10.26.0.11:81'
+端口映射,可以设置多个映射地址，例如 '--mapping udp:0.0.0.0:80-10.26.0.10:80 --mapping tcp:0.0.0.0:80-10.26.0.11:81'
 表示将本地udp 80端口的数据转发到10.26.0.10:80，将本地tcp 80端口的数据转发到10.26.0.11:81，转发的目的地址可以使用域名+端口
 
 ### --compressor `<lz4>`
@@ -196,9 +200,11 @@ dns:
   - 223.5.5.5 # 首选dns
   - 8.8.8.8 # 备选dns
 mapping:
-  - udp:0.0.0.0:80->10.26.0.10:80 # 映射udp数据
-  - tcp:0.0.0.0:80->10.26.0.10:81 # 映射tcp数据
-  - tcp:0.0.0.0:82->localhost:83 # 映射tcp数据
+  - udp:0.0.0.0:80-10.26.0.10:80 # 映射udp数据
+  - tcp:0.0.0.0:80-10.26.0.10:81 # 映射tcp数据
+  - tcp:0.0.0.0:82-localhost:83 # 映射tcp数据
+disable_stats: false # 为true表示关闭统计
+allow_wire_guard: false # 为true则表示允许接入wg
 ```
 
 或者需要哪个配置就加哪个，当然token是必须的
@@ -220,6 +226,14 @@ token: xxx #组网token
 ### --packet-delay `<0>`
 
 模拟延迟,整数,单位毫秒(ms),程序会按设定的值延迟发包,可用于模拟弱网
+
+### --disable-stats
+
+关闭流量统计
+
+### --allow-wg
+
+允许接入WireGuard客户端，和wg混用时必须开启此参数
 
 ### --list
 

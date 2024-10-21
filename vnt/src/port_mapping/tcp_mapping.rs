@@ -6,7 +6,11 @@ pub async fn tcp_mapping(bind_addr: SocketAddr, destination: String) -> anyhow::
     let tcp_listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("TCP binding {:?} failed", bind_addr))?;
-    tokio::spawn(tcp_mapping_(bind_addr, tcp_listener, destination));
+    tokio::spawn(async move {
+        if let Err(e) = tcp_mapping_(bind_addr, tcp_listener, destination).await {
+            log::warn!("tcp_mapping {:?}", e);
+        }
+    });
     Ok(())
 }
 
@@ -28,6 +32,7 @@ async fn tcp_mapping_(
 }
 
 async fn copy(source_tcp: TcpStream, destination: &String) -> anyhow::Result<()> {
+    // 或许这里也应该绑定最匹配的网卡，不然全局代理会影响映射
     let dest_tcp = TcpStream::connect(destination)
         .await
         .with_context(|| format!("TCP connection target failed {:?}", destination))?;

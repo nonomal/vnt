@@ -4,22 +4,21 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 use crate::channel::punch::NatType;
+use crate::channel::socket::{bind_udp, LocalInterface};
 use rand::RngCore;
 use std::net::UdpSocket;
 use stun_format::Attr;
 
-pub fn stun_test_nat(stun_servers: Vec<String>) -> io::Result<(NatType, Vec<Ipv4Addr>, u16)> {
-    let mut th = Vec::new();
-    for _ in 0..2 {
-        let stun_servers = stun_servers.clone();
-        let handle = std::thread::spawn(move || stun_test_nat0(stun_servers));
-        th.push(handle);
-    }
+pub fn stun_test_nat(
+    stun_servers: Vec<String>,
+    default_interface: &LocalInterface,
+) -> anyhow::Result<(NatType, Vec<Ipv4Addr>, u16)> {
     let mut nat_type = NatType::Cone;
     let mut port_range = 0;
     let mut hash_set = HashSet::new();
-    for x in th {
-        match x.join().unwrap() {
+    for _ in 0..2 {
+        let stun_servers = stun_servers.clone();
+        match stun_test_nat0(stun_servers, default_interface) {
             Ok((nat_type_t, ip_list_t, port_range_t)) => {
                 if nat_type_t == NatType::Symmetric {
                     nat_type = NatType::Symmetric;
@@ -39,8 +38,13 @@ pub fn stun_test_nat(stun_servers: Vec<String>) -> io::Result<(NatType, Vec<Ipv4
     Ok((nat_type, hash_set.into_iter().collect(), port_range))
 }
 
-pub fn stun_test_nat0(stun_servers: Vec<String>) -> io::Result<(NatType, Vec<Ipv4Addr>, u16)> {
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
+pub fn stun_test_nat0(
+    stun_servers: Vec<String>,
+    default_interface: &LocalInterface,
+) -> anyhow::Result<(NatType, Vec<Ipv4Addr>, u16)> {
+    let udp = bind_udp("0.0.0.0:0".parse().unwrap(), default_interface)?;
+    udp.set_nonblocking(false)?;
+    let udp: UdpSocket = udp.into();
     udp.set_read_timeout(Some(Duration::from_millis(500)))?;
     let mut nat_type = NatType::Cone;
     let mut min_port = u16::MAX;
@@ -86,13 +90,13 @@ fn test_nat(udp: &UdpSocket, stun_server: &String) -> io::Result<HashSet<SocketA
     udp.connect(stun_server)?;
     let tid = rand::thread_rng().next_u64() as u128;
     let mut addr = HashSet::new();
-    let (mapped_addr1, changed_addr1) = test_nat_(&udp, true, true, tid)?;
+    let (mapped_addr1, changed_addr1) = test_nat_(&udp, stun_server, true, true, tid)?;
     if mapped_addr1.is_ipv4() {
         addr.insert(mapped_addr1);
     }
     if let Some(changed_addr1) = changed_addr1 {
         if udp.connect(changed_addr1).is_ok() {
-            match test_nat_(&udp, false, false, tid + 1) {
+            match test_nat_(&udp, stun_server, false, false, tid + 1) {
                 Ok((mapped_addr2, _)) => {
                     if mapped_addr2.is_ipv4() {
                         addr.insert(mapped_addr1);
@@ -116,6 +120,7 @@ fn test_nat(udp: &UdpSocket, stun_server: &String) -> io::Result<HashSet<SocketA
 
 fn test_nat_(
     udp: &UdpSocket,
+    stun_server: &String,
     change_ip: bool,
     change_port: bool,
     tid: u128,
@@ -134,7 +139,7 @@ fn test_nat_(
         let (len, _addr) = match udp.recv_from(&mut buf) {
             Ok(rs) => rs,
             Err(e) => {
-                log::warn!("stun error {:?}", e);
+                log::warn!("stun {} error {:?}", stun_server, e);
                 continue;
             }
         };
@@ -198,9 +203,6 @@ pub fn send_stun_request() -> Vec<u8> {
 }
 
 pub fn recv_stun_response(buf: &[u8]) -> Option<SocketAddr> {
-    if buf[0] != 0x01 && buf[1] != 0x01 {
-        return None;
-    }
     let msg = stun_format::Msg::from(buf);
     if let Some(tid) = msg.tid() {
         if tid & TAG != TAG {
